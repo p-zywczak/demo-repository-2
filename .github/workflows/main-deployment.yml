@@ -1,0 +1,120 @@
+name: Main Deployment
+
+on:
+  push:
+    branches:
+      - main
+
+permissions: write-all
+
+jobs:
+  create-tag:
+    name: Create Tag on Main and deploy to Prod
+    runs-on: ubuntu-latest
+    if: contains(github.event.head_commit.message, 'release/') || contains(github.event.head_commit.message, 'hotfix/')
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v3
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fetch Latest Release Branch from Repository
+        id: fetch_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCHES=$(gh api repos/${{ vars.REPO_OWNER }}/${{ vars.REPO_NAME }}/branches --paginate --jq '.[].name')
+          RELEASE_BRANCHES=$(echo "$BRANCHES" | grep -E '^release/[0-9]+\.[0-9]+\.[0-9]+$')
+          
+          if [ -z "$RELEASE_BRANCHES" ]; then
+            echo "No release branches found in second repository."
+            echo "LATEST_RELEASE_BRANCH_OTHER_REPO=" >> $GITHUB_ENV
+          else
+            # Wyciągnij wersje, posortuj i wybierz najnowszą
+            LATEST_RELEASE_BRANCH_OTHER_REPO=$(echo "$RELEASE_BRANCHES" | sed 's|release/||' | sort -V | tail -n1)
+            echo "LATEST_RELEASE_BRANCH_OTHER_REPO=${LATEST_RELEASE_BRANCH_OTHER_REPO}" >> $GITHUB_ENV
+          fi  
+
+      - name: Extract Version from Commit Message
+        id: extract_version
+        run: |
+          VERSION=$(git log -1 --pretty=%B | grep -oP '(release|hotfix)/\K[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1 | tr -d '[:space:]')
+          if [ -z "$VERSION" ]; then
+          echo "Version not found in commit message."
+          exit 1
+          fi
+          echo "VER=$VERSION" >> $GITHUB_ENV
+          
+
+      - name: Compare versions
+        id: compare_versions
+        run: |
+          echo "Extracted version: $VER"
+          echo "Latest version in other repo: $LATEST_RELEASE_BRANCH_OTHER_REPO"
+          
+          GREATER_VERSION=$(printf '%s\n%s' "$LATEST_RELEASE_BRANCH_OTHER_REPO" "$VER" | sort -V | tail -n1)
+
+          if [ "$GREATER_VERSION" = "$VER" ]; then
+            echo "VER ($VER) is greater than LATEST_RELEASE_BRANCH_OTHER_REPO ($LATEST_RELEASE_BRANCH_OTHER_REPO)"
+            echo "CREATE_EMPTY_RELEASE=true" >> $GITHUB_ENV
+          else
+            echo "VER ($VER) is not greater than LATEST_RELEASE_BRANCH_OTHER_REPO ($LATEST_RELEASE_BRANCH_OTHER_repo)"
+            echo "CREATE_EMPTY_RELEASE=false" >> $GITHUB_ENV
+          fi
+          
+      - name: Create Tag on Main
+        run: |
+          git tag "v${VER}"
+          git push origin "v${VER}"
+
+      - name: Create Empty Release Branch
+        if: env.CREATE_EMPTY_RELEASE == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN_PAT }}
+        run: |
+          LATEST_RELEASE_SHA=$(gh api repos/${REPO_OWNER}/${REPO_NAME}/git/refs/heads/release/${LATEST_RELEASE_BRANCH_OTHER_REPO} --jq '.object.sha')
+          echo "$VER"
+          echo $LATEST_RELEASE_SHA
+          gh api repos/${REPO_OWNER}/${REPO_NAME}/git/refs -X POST \
+            -F ref="refs/heads/release/${VER}" \
+            -F sha="${LATEST_RELEASE_SHA}" \
+            -H "Authorization: token $GH_TOKEN"
+            
+          MAIN_SHA=$(gh api repos/${REPO_OWNER}/${REPO_NAME}/git/refs/heads/main --jq '.object.sha')
+          gh api repos/${REPO_OWNER}/${REPO_NAME}/git/refs -X POST \
+            -F ref="refs/tags/v${VER}" \
+            -F sha="${MAIN_SHA}" \
+            -H "Authorization: token $GH_TOKEN"
+            
+      - name: Get current date
+        id: get_date
+        run: |
+          TZ="Europe/Warsaw" date "+RELEASE_DATE=%Y-%m-%d %H:%M:%S %Z" >> $GITHUB_ENV
+
+      - name: Generate Changelog
+        id: generate_changelog
+        run: |
+          LAST_TAG=$(git describe --tags --abbrev=0)
+          
+          CHANGELOG=$(git log ${LAST_TAG}..HEAD --pretty=format:"• %s")
+          
+          if [ -z "$CHANGELOG" ]; then
+            CHANGELOG="• Brak zmian."
+          fi
+          
+          echo "CHANGELOG<<EOF" >> $GITHUB_ENV
+          echo "$CHANGELOG" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Hotfix merge to develop
+        if: contains(github.event.head_commit.message, 'hotfix/')
+        run: |
+          echo "Commit message: hotfix/${VER}"
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git fetch --all
+          git checkout develop
+          git pull origin develop
+          git merge origin/hotfix/${VER} --no-ff -m "Merge hotfix branch into develop: ${{ env.VER }}"
+          git push origin develop
